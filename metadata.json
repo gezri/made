@@ -1,0 +1,5 @@
+{
+  "name": "Orbital Expansion Simulator",
+  "description": "A professional-grade global expansion simulator. visualizes strategic growth timelines on an interactive, flat-projection map. Features timeline sequencing, camera automation, and customizable aesthetics.",
+  "requestFramePermissions": []
+}
