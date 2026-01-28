@@ -10,6 +10,7 @@ export interface ExpansionEvent {
   endDay?: number;
   description?: string;
   isVisited: boolean;
+  coordinates?: [number, number]; // [Longitude, Latitude] for specific city targeting
 }
 
 export interface MapColors {
@@ -18,6 +19,7 @@ export interface MapColors {
   unvisited: string;
   stroke: string;
   trail: string;
+  flash: string; // Color used for the fade flash effect
 }
 
 export interface GeoFeature {
@@ -43,9 +45,15 @@ export type CounterPosition =
   | 'bottom-right' | 'center-right' | 'top-right' 
   | 'top-center';
 
-export type InfoStyle = 'default' | 'flag-center' | 'minimal' | '3d-card' | 'cinematic' | '3d-worldmap';
+export type InfoStyle = 'default' | 'flag-center' | 'minimal' | '3d-card' | 'cinematic';
 export type DateFormat = 'number-name' | 'numeric-full' | 'month-name';
 export type MapMode = 'world' | 'usa';
+export type TrailStyle = 'static' | 'grow' | 'rainbow';
+
+export interface LayerConfig {
+  trails: 'base' | 'atmosphere';
+  visited: 'base' | 'atmosphere';
+}
 
 export interface ViewOptions {
   showHeader: boolean;
@@ -56,6 +64,8 @@ export interface ViewOptions {
   showMotionLines: boolean;
   infoStyle: InfoStyle;
   dateFormat: DateFormat;
+  layerConfig: LayerConfig;
+  trailStyle: TrailStyle;
 }
 
 export interface SimulationConfig {
@@ -64,5 +74,8 @@ export interface SimulationConfig {
   animationSpeed: number;    // MS to travel between points
   waitDuration: number;      // MS to wait at the country before moving next
   centerIconScale: number;   // Scale multiplier for the center icon
+  targetMarkerScale: number; // Scale multiplier for the target indicator markers
+  flashDuration: number;     // MS for the visit flash animation
   mapMode: MapMode;          // Toggle between World and USA
+  lineWidth?: number;
 }

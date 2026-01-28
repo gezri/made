@@ -23,9 +23,14 @@ const App: React.FC = () => {
     showCounter: true,
     counterPosition: 'top-right',
     showCenterIcon: false,
-    showMotionLines: false,
+    showMotionLines: true,
     infoStyle: 'default',
     dateFormat: 'numeric-full',
+    trailStyle: 'grow',
+    layerConfig: {
+        trails: 'base',
+        visited: 'base'
+    }
   });
   const [centerIconUrl, setCenterIconUrl] = useState<string | null>(null);
   const [targetMarkerUrl, setTargetMarkerUrl] = useState<string | null>(null);

@@ -1,9 +1,34 @@
 
-import React, { useLayoutEffect, useRef, useState, useMemo, useEffect } from 'react';
+import React, { useLayoutEffect, useRef, useState, useMemo, useEffect, useCallback } from 'react';
 import * as d3 from 'd3';
 import * as topojson from 'topojson-client';
 import { GeoFeature, MapColors, ExpansionEvent, SimulationState, ViewOptions, SimulationConfig } from '../types';
-import { TOPOJSON_URL, US_GEOJSON_URL, HOME_COUNTRY, COUNTRY_ISO_CODES, HOME_COORDINATES } from '../constants';
+import { TOPOJSON_URL, US_GEOJSON_URL, HOME_COORDINATES, COUNTRY_ISO_CODES, MAJOR_CITIES } from '../constants';
+
+// Helper to convert hex to RGB for accurate interpolation
+const hexToRgb = (hex: string) => {
+    const shorthandRegex = /^#?([a-f\d])([a-f\d])([a-f\d])$/i;
+    hex = hex.replace(shorthandRegex, (m, r, g, b) => r + r + g + g + b + b);
+    const result = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+    return result ? {
+        r: parseInt(result[1], 16),
+        g: parseInt(result[2], 16),
+        b: parseInt(result[3], 16)
+    } : null;
+};
+
+// Precise color interpolation between flash and base land colors
+const interpolateColor = (color1: string, color2: string, t: number) => {
+    const c1 = hexToRgb(color1);
+    const c2 = hexToRgb(color2);
+    if (!c1 || !c2) return color2;
+    // Cubic ease-in for the flash fade-out
+    const easedT = t * t * t; 
+    const r = Math.round(c1.r + (c2.r - c1.r) * easedT);
+    const g = Math.round(c1.g + (c2.g - c1.g) * easedT);
+    const b = Math.round(c1.b + (c2.b - c1.b) * easedT);
+    return `rgb(${r}, ${g}, ${b})`;
+};
 
 interface WorldMapProps {
   events: ExpansionEvent[];
@@ -34,798 +59,446 @@ const WorldMap: React.FC<WorldMapProps> = ({
 }) => {
   const svgRef = useRef<SVGSVGElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const markersCanvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const [geoData, setGeoData] = useState<GeoFeature[]>([]);
+  const [usStatesData, setUsStatesData] = useState<GeoFeature[]>([]);
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
-  
-  // Internal state for "Fade Close -> Fade Open" cycle logic
   const [visibleEvent, setVisibleEvent] = useState<ExpansionEvent | null>(null);
-  const [isExiting, setIsExiting] = useState(false);
+  const [isOverlayActive, setIsOverlayActive] = useState(false);
 
-  // Use separate refs for projection to switch types efficiently
   const projectionRef = useRef<d3.GeoProjection>(d3.geoOrthographic());
-  
-  // Track current rotation/scale/translate for smooth transitions
   const currentTransform = useRef({ rotate: [0, 0, 0] as [number, number, number], scale: 250, translate: [0, 0] as [number, number] });
-  
-  // Track previous state to avoid unnecessary re-animations
   const prevEventIdRef = useRef<string | null>(null);
   const prevSimStateRef = useRef<SimulationState>(SimulationState.IDLE);
-  const prevMapModeRef = useRef<string>(config.mapMode);
+  const transitionStartTimeRef = useRef<number>(0);
+  const isTransitioningRef = useRef<boolean>(false);
 
-  // Sync currentEventId to visibleEvent with Delay logic for transitions
+  // Animation states for flash tracking
+  const flashTimestamps = useRef<Map<string, number>>(new Map());
+  const prevEventsRef = useRef<ExpansionEvent[]>([]);
+
+  // Feature Resolver - handles cities, states, and countries
+  const resolveFeature = useCallback((name: string) => {
+      const cleanName = name.trim();
+      const lowerName = cleanName.toLowerCase();
+
+      // Priority 1: Direct state/country matches
+      if (cleanName.endsWith(" (USA)")) return usStatesData.find(f => f.properties.name === cleanName.replace(" (USA)", ""));
+      if (cleanName.endsWith(" (Country)")) return geoData.find(f => f.properties.name === cleanName.replace(" (Country)", ""));
+      
+      // Handle known aliases or common errors
+      let feature = geoData.find(f => f.properties.name.toLowerCase() === lowerName) || 
+                    usStatesData.find(f => f.properties.name.toLowerCase() === lowerName);
+      if (feature) return feature;
+
+      // Priority 2: Cities
+      const city = MAJOR_CITIES.find(c => c.name.toLowerCase() === lowerName);
+      if (city) {
+          const parentName = city.country.toLowerCase();
+          feature = geoData.find(f => f.properties.name.toLowerCase() === parentName) || 
+                    usStatesData.find(f => f.properties.name.toLowerCase() === parentName);
+          if (feature) return feature;
+      }
+
+      // Priority 3: Fuzzy USA state match
+      if (lowerName.endsWith(" usa") || lowerName.endsWith(" us") || lowerName.includes("virginia")) {
+          const raw = cleanName.replace(/,?\s*usa$/i, "").replace(/,?\s*us$/i, "").trim();
+          const state = usStatesData.find(f => f.properties.name.toLowerCase() === raw.toLowerCase());
+          if (state) return state;
+      }
+      
+      return undefined;
+  }, [geoData, usStatesData]);
+
+  // Robust Selection & Visit Flash Detection
+  useEffect(() => {
+    // 1. Detect when a country/city is selected (Targeted)
+    if (currentEventId && currentEventId !== prevEventIdRef.current) {
+        const target = events.find(e => e.id === currentEventId);
+        if (target) {
+            const feature = resolveFeature(target.countryName);
+            if (feature) {
+                const nameKey = feature.properties.name;
+                flashTimestamps.current.set(nameKey, performance.now());
+            }
+        }
+    }
+
+    // 2. Detect when a location is visited (Landed)
+    events.forEach(event => {
+        const prevEvent = prevEventsRef.current.find(e => e.id === event.id);
+        if (event.isVisited && (!prevEvent || !prevEvent.isVisited)) {
+            const feature = resolveFeature(event.countryName);
+            if (feature) {
+                const nameKey = feature.properties.name;
+                flashTimestamps.current.set(nameKey, performance.now());
+            }
+        }
+    });
+
+    if (simulationState === SimulationState.IDLE && prevSimStateRef.current !== SimulationState.IDLE) {
+        flashTimestamps.current.clear();
+    }
+    
+    prevEventsRef.current = [...events];
+  }, [events, currentEventId, simulationState, resolveFeature]);
+
+  // Sync currentEventId to visibleEvent
   useEffect(() => {
     const targetEvent = events.find(e => e.id === currentEventId) || null;
-    
-    // Only apply the "Exit -> Enter" cycle for '3d-worldmap' style when playing
-    if (viewOptions.infoStyle === '3d-worldmap' && simulationState === SimulationState.PLAYING) {
-        if (targetEvent?.id !== visibleEvent?.id) {
-             if (visibleEvent) {
-                 // Trigger exit of current visible event
-                 setIsExiting(true);
-                 const timer = setTimeout(() => {
-                     setVisibleEvent(targetEvent);
-                     setIsExiting(false);
-                 }, 600); // 600ms exit duration matches CSS
-                 return () => clearTimeout(timer);
-             } else {
-                 // First event, just show it
-                 setVisibleEvent(targetEvent);
-                 setIsExiting(false);
-             }
-        }
+    if (targetEvent) {
+      setVisibleEvent(targetEvent);
+      setIsOverlayActive(true);
     } else {
-        // For all other styles, sync immediately
-        setVisibleEvent(targetEvent);
-        setIsExiting(false);
+      setIsOverlayActive(false);
     }
-  }, [currentEventId, events, viewOptions.infoStyle, simulationState]);
+  }, [currentEventId, events]);
 
   // Load Map Data
   useEffect(() => {
     const fetchData = async () => {
       try {
-        let features: GeoFeature[] = [];
-        let names: string[] = [];
+        let worldFeatures: GeoFeature[] = [];
+        let usFeatures: GeoFeature[] = [];
+        
+        const usResponse = await fetch(US_GEOJSON_URL);
+        const usData = await usResponse.json();
+        usFeatures = usData.features;
+        setUsStatesData(usFeatures);
 
         if (config.mapMode === 'usa') {
-            const response = await fetch(US_GEOJSON_URL);
-            const data = await response.json();
-            features = data.features;
+            setGeoData(usFeatures);
+            onMapReady(usFeatures.map(f => f.properties.name).sort());
         } else {
             const response = await fetch(TOPOJSON_URL);
             const data = await response.json();
             // @ts-ignore
-            features = topojson.feature(data, data.objects.countries).features as GeoFeature[];
+            worldFeatures = topojson.feature(data, data.objects.countries).features as GeoFeature[];
+            setGeoData(worldFeatures);
+
+            const countrySet = new Set(worldFeatures.map(f => f.properties.name));
+            const stateSet = new Set(usFeatures.map(f => f.properties.name));
+            const finalNames: string[] = [];
+            
+            worldFeatures.forEach(f => {
+                const name = f.properties.name; if (!name) return;
+                finalNames.push(stateSet.has(name) ? `${name} (Country)` : name);
+            });
+            usFeatures.forEach(f => {
+                const name = f.properties.name; if (!name) return;
+                if (countrySet.has(name)) finalNames.push(`${name} (USA)`); else finalNames.push(name);
+            });
+            onMapReady(Array.from(new Set(finalNames)).sort());
         }
-        
-        setGeoData(features);
-        
-        names = features
-          .map(f => f.properties.name)
-          .filter(n => n)
-          .sort();
-        onMapReady(names);
-      } catch (error) {
-        console.error("Failed to load map data", error);
-      }
+      } catch (error) { console.error("Map Data Fetch Error", error); }
     };
     fetchData();
-  }, [config.mapMode]);
+  }, [config.mapMode, onMapReady]);
 
-  // Handle Resize
+  // Resize Handling
   useEffect(() => {
     const handleResize = () => {
       if (containerRef.current) {
         const { clientWidth, clientHeight } = containerRef.current;
         setDimensions({ width: clientWidth, height: clientHeight });
-        
-        // Resize canvas resolution for high DPI
-        if (canvasRef.current) {
-            const dpr = window.devicePixelRatio || 1;
-            canvasRef.current.width = clientWidth * dpr;
-            canvasRef.current.height = clientHeight * dpr;
-            canvasRef.current.style.width = `${clientWidth}px`;
-            canvasRef.current.style.height = `${clientHeight}px`;
-            
-            const ctx = canvasRef.current.getContext('2d');
-            if (ctx) ctx.scale(dpr, dpr);
-        }
+        const dpr = window.devicePixelRatio || 1;
+        [canvasRef, markersCanvasRef].forEach(ref => {
+            if (ref.current) {
+                ref.current.width = clientWidth * dpr; ref.current.height = clientHeight * dpr;
+                ref.current.style.width = `${clientWidth}px`; ref.current.style.height = `${clientHeight}px`;
+                const ctx = ref.current.getContext('2d'); if (ctx) ctx.scale(dpr, dpr);
+            }
+        });
       }
     };
-    window.addEventListener('resize', handleResize);
-    handleResize();
+    window.addEventListener('resize', handleResize); handleResize();
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  // Update Projection Logic
+  // Update Projection
   useEffect(() => {
      if (dimensions.width === 0) return;
-     
-     // Re-initialize projection based on mode
      if (config.mapMode === 'usa') {
-        projectionRef.current = d3.geoAlbersUsa()
-            .translate([dimensions.width / 2, dimensions.height / 2])
-            .scale(dimensions.width * 1.3);
+        projectionRef.current = d3.geoAlbersUsa().translate([dimensions.width / 2, dimensions.height / 2]).scale(dimensions.width * 1.3);
      } else {
-        projectionRef.current = d3.geoOrthographic()
-            .translate([dimensions.width / 2, dimensions.height / 2])
-            .clipAngle(90);
+        projectionRef.current = d3.geoOrthographic().translate([dimensions.width / 2, dimensions.height / 2]).clipAngle(90);
      }
-     
-     // Reset transform ref when mode changes
-     if (prevMapModeRef.current !== config.mapMode) {
-        if (config.mapMode === 'usa') {
-            currentTransform.current = { 
-                rotate: [0,0,0], 
-                scale: dimensions.width * 1.3, 
-                translate: [dimensions.width / 2, dimensions.height / 2] 
-            };
-        } else {
-            const baseScale = (Math.min(dimensions.width, dimensions.height) / 2.2) * config.zoomOutScale;
-            currentTransform.current = { 
-                rotate: [-HOME_COORDINATES[0], -HOME_COORDINATES[1], 0], 
-                scale: baseScale, 
-                translate: [dimensions.width / 2, dimensions.height / 2]
-            };
-            projectionRef.current.rotate([-HOME_COORDINATES[0], -HOME_COORDINATES[1], 0]);
-        }
-        prevMapModeRef.current = config.mapMode;
-     }
-
   }, [config.mapMode, dimensions]);
 
-  // Load Target Marker Image for Canvas
+  // Marker Loader
   const [markerImage, setMarkerImage] = useState<HTMLImageElement | null>(null);
   useEffect(() => {
     if (targetMarkerUrl) {
-        const img = new Image();
-        img.src = targetMarkerUrl;
-        img.onload = () => setMarkerImage(img);
-    } else {
-        setMarkerImage(null);
-    }
+        const img = new Image(); img.src = targetMarkerUrl; img.onload = () => setMarkerImage(img);
+    } else setMarkerImage(null);
   }, [targetMarkerUrl]);
 
-  // D3 Render & Logic
-  useLayoutEffect(() => {
-    if (!geoData.length || dimensions.width === 0 || !svgRef.current || !canvasRef.current) return;
+  // Resolved Event Coordinates
+  const resolvedEventData = useMemo(() => {
+    return events.map(e => {
+        let feature = resolveFeature(e.countryName);
+        let explicitCoords: [number, number] | null = e.coordinates || null;
+        
+        if (!explicitCoords) {
+             const city = MAJOR_CITIES.find(c => c.name.toLowerCase() === e.countryName.toLowerCase());
+             if (city) explicitCoords = city.coords;
+        }
+        
+        const centroid = explicitCoords || (feature ? d3.geoCentroid(feature as any) : null);
+        return { event: e, feature, centroid };
+    }).filter(item => item.feature || item.centroid);
+  }, [events, resolveFeature]);
 
+  // Master Render Loop
+  useLayoutEffect(() => {
+    if (!geoData.length || dimensions.width === 0 || !svgRef.current || !canvasRef.current || !markersCanvasRef.current) return;
     const svg = d3.select(svgRef.current);
-    const canvas = canvasRef.current;
-    const ctx = canvas.getContext('2d');
-    
+    const ctx = canvasRef.current.getContext('2d');
+    const markerCtx = markersCanvasRef.current.getContext('2d');
     const { width, height } = dimensions;
     const projection = projectionRef.current;
-    
-    // SVG Path Generator
-    const pathGeneratorSvg = d3.geoPath().projection(projection);
-    
-    // Canvas Path Generator
     const pathGeneratorCanvas = d3.geoPath().projection(projection).context(ctx);
-
+    const pathGeneratorMarker = d3.geoPath().projection(projection).context(markerCtx);
     const isGlobe = config.mapMode === 'world';
+    const baseScale = isGlobe ? (Math.min(width, height) / 2.2) * config.zoomOutScale : width * 1.3;
 
-    // Base Scale Calculation
-    let baseScale = 0;
-    if (isGlobe) {
-        baseScale = (Math.min(width, height) / 2.2) * config.zoomOutScale;
-    } else {
-        baseScale = width * 1.3;
-    }
-
-    // Initial positioning for Globe mode if needed
-    if (isGlobe && simulationState === SimulationState.IDLE && prevSimStateRef.current !== SimulationState.IDLE) {
-         if (currentTransform.current.scale === 250) {
-           (projection as d3.GeoProjection).scale(baseScale).rotate([-HOME_COORDINATES[0], -HOME_COORDINATES[1], 0]);
-           currentTransform.current = { 
-               rotate: [-HOME_COORDINATES[0], -HOME_COORDINATES[1], 0], 
-               scale: baseScale,
-               translate: [width/2, height/2]
-           };
-         }
-    }
-
-    // Define defs for SVG (Gradients)
+    // Defs for atmosphere
     let defs = svg.select('defs');
     if (defs.empty()) {
         defs = svg.append('defs');
-        const gradient = defs.append('radialGradient')
-            .attr('id', 'atmosphere')
-            .attr('cx', '50%')
-            .attr('cy', '50%')
-            .attr('r', '50%');
+        const gradient = defs.append('radialGradient').attr('id', 'atmosphere').attr('cx', '50%').attr('cy', '50%').attr('r', '50%');
         gradient.append('stop').attr('offset', '80%').attr('stop-color', 'transparent');
         gradient.append('stop').attr('offset', '100%').attr('stop-color', '#60a5fa').attr('stop-opacity', 0.3);
     }
-
-    /**
-     * CORE RENDER FUNCTION
-     * @param animationProgress - 0 to 1, used to animate the active trail growing
-     */
-    const render = (animationProgress: number = 1.0) => {
-      // --- SVG LAYER (Base Map) ---
-      svg.selectAll('g.map-layer').remove(); 
-      const g = svg.append('g').attr('class', 'map-layer');
-
-      // 1. Background (Ocean)
-      if (isGlobe) {
-          g.append('path')
-            .datum({ type: 'Sphere' })
-            .attr('d', pathGeneratorSvg as any)
-            .attr('fill', colors.background)
-            .attr('stroke', colors.stroke)
-            .attr('stroke-width', 1);
-
-          const graticule = d3.geoGraticule();
-          g.append('path')
-            .datum(graticule())
-            .attr('d', pathGeneratorSvg as any)
-            .attr('fill', 'none')
-            .attr('stroke', '#ffffff')
-            .attr('stroke-opacity', 0.05);
-      }
-
-      // 2. Features (Countries)
-      g.selectAll('path.feature')
-        .data(geoData)
-        .enter()
-        .append('path')
-        .attr('class', 'feature')
-        .attr('d', pathGeneratorSvg as any)
-        .attr('fill', (d: GeoFeature) => {
-           const isVisited = events.some(e => e.countryName === d.properties.name && e.isVisited);
-           return isVisited ? colors.visited : colors.unvisited;
-        })
-        .attr('stroke', colors.stroke)
-        .attr('stroke-width', 0.5);
-
-       // Atmosphere (SVG)
-       if (isGlobe) {
-          g.append('circle')
-            .attr('cx', width / 2)
-            .attr('cy', height / 2)
-            .attr('r', (projection as d3.GeoProjection).scale())
-            .attr('fill', 'url(#atmosphere)')
-            .attr('pointer-events', 'none');
-       }
-
-       // --- CANVAS LAYER (Trails & Markers) ---
-       if (!ctx) return;
-       ctx.clearRect(0, 0, width, height);
-       
-       if (viewOptions.showMotionLines) {
-           // Prepare trails
-           const currentIndex = events.findIndex(e => e.id === currentEventId);
-           const maxStaticIndex = simulationState === SimulationState.PLAYING 
-               ? Math.max(-1, currentIndex - 1) 
-               : events.length - 1;
-
-           // Config for Trails
-           const trailColor = colors.trail || '#ffffff';
-           
-           ctx.lineCap = 'round';
-           ctx.lineJoin = 'round';
-
-           // A. Static Trails (History)
-           // Batch path drawing for performance if desired, or individual for glows
-           ctx.beginPath();
-           for (let i = 0; i < maxStaticIndex; i++) {
-               const startEvent = events[i];
-               const endEvent = events[i + 1];
-               if (!startEvent || !endEvent) continue;
-
-               const startFeature = geoData.find(f => f.properties.name === startEvent.countryName);
-               const endFeature = geoData.find(f => f.properties.name === endEvent.countryName);
-               
-               if (startFeature && endFeature) {
-                   const startCentroid = d3.geoCentroid(startFeature as any);
-                   const endCentroid = d3.geoCentroid(endFeature as any);
-                   pathGeneratorCanvas({
-                       type: 'LineString',
-                       coordinates: [startCentroid, endCentroid]
-                   });
-               }
-           }
-           
-           // Stroke Static
-           ctx.lineWidth = 2.5;
-           ctx.strokeStyle = trailColor;
-           ctx.globalAlpha = 0.6;
-           ctx.shadowColor = trailColor;
-           ctx.shadowBlur = 10;
-           ctx.stroke();
-           
-           // Reset for Active
-           ctx.globalAlpha = 1.0;
-           ctx.shadowBlur = 0;
-
-           // B. Active Trail (Animating)
-           if (simulationState === SimulationState.PLAYING && currentIndex > 0) {
-                const prevEvent = events[currentIndex - 1];
-                const currEvent = events[currentIndex];
-                const startFeature = geoData.find(f => f.properties.name === prevEvent.countryName);
-                const endFeature = geoData.find(f => f.properties.name === currEvent.countryName);
-
-                if (startFeature && endFeature) {
-                    const startCentroid = d3.geoCentroid(startFeature as any);
-                    const endCentroid = d3.geoCentroid(endFeature as any);
-                    const interpolatedEnd = d3.geoInterpolate(startCentroid, endCentroid)(animationProgress);
-                    
-                    const activeObj = {
-                         type: 'LineString',
-                         coordinates: [startCentroid, interpolatedEnd]
-                    };
-
-                    // Draw Active Glow
-                    ctx.beginPath();
-                    pathGeneratorCanvas(activeObj as any);
-                    ctx.strokeStyle = trailColor;
-                    ctx.lineWidth = 4;
-                    ctx.shadowColor = 'white'; // White hot core for active
-                    ctx.shadowBlur = 20;
-                    ctx.stroke();
-                }
-           }
-       }
-
-       // C. Target Markers (Canvas for synchronization)
-       if (markerImage) {
-            const eventsToShow = events.filter((e, idx) => e.isVisited || e.id === currentEventId);
-            
-            // Remove shadow for images
-            ctx.shadowBlur = 0;
-            
-            eventsToShow.forEach(event => {
-                 const feature = geoData.find(f => f.properties.name === event.countryName);
-                 if (feature) {
-                     const centroid = d3.geoCentroid(feature as any);
-                     const coords = projection(centroid);
-                     // Check if visible (not clipped on back of globe)
-                     if (coords && d3.geoPath().projection(projection)({type:'Point', coordinates: centroid})) {
-                         const [cx, cy] = coords;
-                         const isTarget = event.id === currentEventId;
-                         
-                         const size = 48;
-                         const scale = isTarget && animationProgress > 0.9 ? 1.2 : 1.0;
-                         const finalSize = size * scale;
-                         
-                         const x = cx - finalSize / 2;
-                         const y = cy - finalSize; // Bottom center anchored
-
-                         ctx.globalAlpha = isTarget ? 1.0 : 0.85;
-                         ctx.drawImage(markerImage, x, y, finalSize, finalSize);
-                     }
-                 }
-            });
-            ctx.globalAlpha = 1.0;
-       }
-    };
-
-    // Camera / Animation Logic
-    const animateCamera = () => {
-      let targetCenter: [number, number] | null = null;
-      let targetScale = baseScale;
-      let duration = config.animationSpeed;
-      
-      if (simulationState === SimulationState.COMPLETED) {
-         if (isGlobe) targetCenter = HOME_COORDINATES;
-         targetScale = baseScale; 
-      } else if (simulationState === SimulationState.PLAYING && currentEventId) {
-         const currentEvent = events.find(e => e.id === currentEventId);
-         if (currentEvent) {
-            const feature = geoData.find(f => f.properties.name === currentEvent.countryName);
-            if (feature) {
-               targetCenter = d3.geoCentroid(feature as any);
-               targetScale = baseScale * config.zoomInMultiplier; 
-            }
-         }
-      }
-
-      const hasTargetChanged = currentEventId !== prevEventIdRef.current;
-      const hasStateChanged = simulationState !== prevSimStateRef.current;
-      
-      if (!hasTargetChanged && !hasStateChanged && targetCenter) {
-          if (simulationState === SimulationState.IDLE) {
-             const currentBase = isGlobe ? (Math.min(width, height) / 2.2) * config.zoomOutScale : width * 1.3;
-             if (Math.abs(currentTransform.current.scale - currentBase) > 1) {
-                render(1);
-             }
-          } else if (simulationState === SimulationState.PLAYING) {
-             render(1); 
-          }
-          return;
-      }
-
-      prevEventIdRef.current = currentEventId;
-      prevSimStateRef.current = simulationState;
-
-      if (targetCenter) {
-        svg.interrupt(); // Stop any D3 transitions on the SVG selection (which we use for tweening)
-
-        if (isGlobe) {
-            const r1: [number, number, number] = [-targetCenter[0], -targetCenter[1], 0];
-            const s1 = targetScale;
-            const r0 = currentTransform.current.rotate;
-            const s0 = currentTransform.current.scale;
-            const needsZoomOut = simulationState === SimulationState.PLAYING && s0 > baseScale * 1.5; 
-            
-            svg.transition()
-                .duration(duration)
-                .ease(d3.easeCubicInOut)
-                .tween("render", () => {
-                   const i_r = d3.interpolate(r0, r1);
-                   const i_s = needsZoomOut 
-                      ? (t: number) => {
-                          if (t < 0.5) return d3.interpolate(s0, baseScale)(t * 2);
-                          return d3.interpolate(baseScale, s1)((t - 0.5) * 2);
-                        }
-                      : d3.interpolate(s0, s1);
-
-                   return (t: number) => {
-                      projection.rotate(i_r(t) as [number, number, number]);
-                      projection.scale(i_s(t));
-                      currentTransform.current = { ...currentTransform.current, rotate: projection.rotate() as any, scale: projection.scale() };
-                      render(t);
-                   };
-                })
-                .on("end", () => { render(1); onAnimationComplete(); });
-        } else {
-            // USA Albers
-            const tempProj = d3.geoAlbersUsa().scale(targetScale).translate([width/2, height/2]);
-            const px = tempProj(targetCenter);
-            let t1: [number, number] = px ? [width/2 + (width/2 - px[0]), height/2 + (height/2 - px[1])] : [width/2, height/2];
-            
-            const t0 = currentTransform.current.translate;
-            const s0 = currentTransform.current.scale;
-            const needsZoomOut = simulationState === SimulationState.PLAYING && s0 > baseScale * 1.5;
-
-            svg.transition()
-                .duration(duration)
-                .ease(d3.easeCubicInOut)
-                .tween("render", () => {
-                     const i_t = d3.interpolate(t0, t1);
-                     const i_s = needsZoomOut 
-                      ? (t: number) => {
-                          if (t < 0.5) return d3.interpolate(s0, baseScale)(t * 2);
-                          return d3.interpolate(baseScale, targetScale)((t - 0.5) * 2);
-                        }
-                      : d3.interpolate(s0, targetScale);
-                     
-                     return (t: number) => {
-                         projection.translate(i_t(t)).scale(i_s(t));
-                         currentTransform.current = { ...currentTransform.current, translate: projection.translate() as [number, number], scale: projection.scale() };
-                         render(t);
-                     };
-                })
-                .on("end", () => { render(1); onAnimationComplete(); });
-        }
-      } else {
-        render(1);
-      }
-    };
-
-    animateCamera();
-
-    // Drag behavior (Idle only)
-    if (simulationState === SimulationState.IDLE || simulationState === SimulationState.COMPLETED) {
-       const drag = d3.drag<SVGSVGElement, unknown>()
-        .on('drag', (event) => {
-           if (isGlobe) {
-              const rotate = projection.rotate();
-              const k = 75 / projection.scale();
-              projection.rotate([rotate[0] + event.dx * k, rotate[1] - event.dy * k]);
-              currentTransform.current.rotate = projection.rotate();
-           } else {
-              const currT = projection.translate();
-              projection.translate([currT[0] + event.dx, currT[1] + event.dy]);
-              currentTransform.current.translate = projection.translate() as [number, number];
-           }
-           render(1);
-        });
-        svg.call(drag);
-    } else {
-       svg.on('.drag', null);
+    svg.selectAll('circle.atmosphere').remove();
+    if (isGlobe) { 
+        svg.append('circle').attr('class', 'atmosphere').attr('cx', width/2).attr('cy', height/2).attr('r', (projection as d3.GeoProjection).scale()).attr('fill', 'url(#atmosphere)').attr('pointer-events', 'none'); 
     }
 
-  }, [geoData, dimensions, events, colors, simulationState, currentEventId, config, targetMarkerUrl, markerImage]);
+    const render = () => {
+        if (!ctx || !markerCtx) return;
+        const now = performance.now();
+        const visitedNames = new Set<string>();
+        resolvedEventData.forEach(r => { if (r.event.isVisited && r.feature) visitedNames.add(r.feature.properties.name); });
 
-  const getFlagUrl = (name: string) => {
-    if (config.mapMode === 'usa') return null;
-    const code = COUNTRY_ISO_CODES[name];
-    return code ? `https://flagcdn.com/w160/${code.toLowerCase()}.png` : null;
-  };
+        ctx.clearRect(0, 0, width, height); markerCtx.clearRect(0, 0, width, height);
+        
+        if (isGlobe) {
+            ctx.beginPath(); pathGeneratorCanvas({ type: 'Sphere' } as any); ctx.fillStyle = colors.background; ctx.fill(); ctx.lineWidth = 1; ctx.strokeStyle = colors.stroke; ctx.stroke();
+            ctx.beginPath(); pathGeneratorCanvas(d3.geoGraticule()() as any); ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)'; ctx.stroke();
+        }
 
-  const getFormattedDate = (event: ExpansionEvent) => {
-      switch (viewOptions.dateFormat) {
-          case 'number-name':
-              return `${event.day.toString().padStart(2, '0')} ${new Date(0, event.month - 1).toLocaleString('default', { month: 'long' })}`;
-          case 'month-name':
-              return `${new Date(0, event.month - 1).toLocaleString('default', { month: 'long' })} ${event.year}`;
-          case 'numeric-full':
-          default:
-              return `${event.year}.${event.month.toString().padStart(2, '0')}.${event.day.toString().padStart(2, '0')}`;
+        // Base layer
+        ctx.lineWidth = 0.5; ctx.strokeStyle = colors.stroke;
+        ctx.beginPath(); geoData.forEach(d => { if (!visitedNames.has(d.properties.name)) pathGeneratorCanvas(d as any); });
+        ctx.fillStyle = colors.unvisited; ctx.fill(); ctx.stroke();
+
+        const drawPass = (targetCtx: CanvasRenderingContext2D, pathGen: d3.GeoPath) => {
+            const currentTargetEvent = events.find(e => e.id === currentEventId);
+            const currentTargetFeature = currentTargetEvent ? resolveFeature(currentTargetEvent.countryName) : null;
+            const currentTargetName = currentTargetFeature ? currentTargetFeature.properties.name : null;
+
+            // Render primary geometry (Countries or States depending on mode)
+            geoData.forEach(d => {
+                const name = d.properties.name;
+                const isVisited = visitedNames.has(name);
+                const isCurrentTarget = currentTargetName === name;
+                const flashStart = flashTimestamps.current.get(name);
+
+                if (isVisited || isCurrentTarget || flashStart) {
+                    targetCtx.beginPath(); pathGen(d as any);
+                    let baseColor = isVisited ? colors.visited : colors.unvisited;
+                    let finalColor = baseColor;
+                    if (flashStart && config.flashDuration > 0) {
+                        const elapsed = now - flashStart;
+                        if (elapsed < config.flashDuration) {
+                            finalColor = interpolateColor(colors.flash || '#ffffff', baseColor, elapsed / config.flashDuration);
+                        } else { flashTimestamps.current.delete(name); }
+                    }
+                    targetCtx.fillStyle = finalColor; targetCtx.fill(); targetCtx.stroke();
+                }
+            });
+            
+            // Render detailed US states in World Mode
+            if (isGlobe && usStatesData.length > 0) {
+                 usStatesData.forEach(d => {
+                    const name = d.properties.name;
+                    const isVisited = visitedNames.has(name);
+                    const isCurrentTarget = currentTargetName === name;
+                    const flashStart = flashTimestamps.current.get(name);
+
+                    if (isVisited || isCurrentTarget || flashStart) {
+                        targetCtx.beginPath(); pathGen(d as any);
+                        let baseColor = isVisited ? colors.visited : colors.unvisited;
+                        let finalColor = baseColor;
+                        if (flashStart && config.flashDuration > 0) {
+                            const elapsed = now - flashStart;
+                            if (elapsed < config.flashDuration) {
+                                finalColor = interpolateColor(colors.flash || '#ffffff', baseColor, elapsed / config.flashDuration);
+                            }
+                        }
+                        targetCtx.fillStyle = finalColor; targetCtx.fill(); targetCtx.stroke();
+                    }
+                 });
+            }
+        };
+
+        if (viewOptions.layerConfig?.visited !== 'atmosphere') drawPass(ctx, pathGeneratorCanvas);
+        
+        if (isGlobe && usStatesData.length > 0) {
+            ctx.lineWidth = 0.5; ctx.strokeStyle = 'rgba(71, 85, 105, 0.4)'; ctx.beginPath();
+            usStatesData.forEach(d => { pathGeneratorCanvas(d as any); }); ctx.stroke(); 
+        }
+
+        const drawTrails = (context: CanvasRenderingContext2D, pathGen: d3.GeoPath) => {
+            if (viewOptions.showMotionLines) {
+                const currentIndex = events.findIndex(e => e.id === currentEventId);
+                if (simulationState === SimulationState.PLAYING && currentIndex > 0) {
+                     const prev = resolvedEventData.find(r => r.event.id === events[currentIndex-1].id);
+                     const curr = resolvedEventData.find(r => r.event.id === events[currentIndex].id);
+                     if (prev && curr && prev.centroid && curr.centroid) {
+                        const elapsed = now - transitionStartTimeRef.current;
+                        const linearT = Math.min(1, elapsed / config.animationSpeed);
+                        const headT = d3.easeCubicInOut(linearT);
+                        const tailT = viewOptions.trailStyle === 'static' ? 0 : d3.easeCubicInOut(Math.max(0, linearT - 0.25)); 
+                        
+                        const interpolator = d3.geoInterpolate(prev.centroid, curr.centroid);
+                        const headPoint = interpolator(headT); const tailPoint = interpolator(tailT);
+                        const pHead = projection(headPoint); const pTail = projection(tailPoint);
+                        
+                        if (pHead && pTail) {
+                            context.beginPath(); 
+                            pathGen({ type: 'LineString', coordinates: [viewOptions.trailStyle === 'static' ? prev.centroid : tailPoint, headPoint] } as any);
+                            context.lineWidth = (config.lineWidth || 2.5) * 2;
+                            if (viewOptions.trailStyle === 'rainbow') {
+                                const grad = context.createLinearGradient(pTail[0], pTail[1], pHead[0], pHead[1]);
+                                ['#ef4444','#f59e0b','#fbbf24','#10b981','#3b82f6','#8b5cf6'].forEach((c, i) => grad.addColorStop(i*0.2, c)); context.strokeStyle = grad;
+                            } else context.strokeStyle = colors.trail || '#ffffff';
+                            context.stroke();
+                        }
+                     }
+                }
+            }
+        };
+
+        if (viewOptions.layerConfig?.trails !== 'atmosphere') drawTrails(ctx, pathGeneratorCanvas);
+        if (viewOptions.layerConfig?.visited === 'atmosphere') drawPass(markerCtx, pathGeneratorMarker);
+        if (viewOptions.layerConfig?.trails === 'atmosphere') drawTrails(markerCtx, pathGeneratorMarker);
+
+        if (markerImage) {
+            resolvedEventData.forEach(r => {
+                 const coords = r.centroid ? projection(r.centroid) : null;
+                 if (coords && (r.event.id === currentEventId || r.event.isVisited)) {
+                     const isTarget = r.event.id === currentEventId;
+                     const scale = (isTarget ? 1.4 : 1.0) * (config.targetMarkerScale || 1.0);
+                     const finalSize = 48 * scale;
+                     markerCtx.drawImage(markerImage, coords[0] - finalSize/2, coords[1] - finalSize, finalSize, finalSize);
+                 }
+            });
+        }
+    };
+
+    const startTransition = () => {
+      let targetCenter: [number, number] | null = null; let targetScale = baseScale;
+      if (currentEventId !== prevEventIdRef.current) transitionStartTimeRef.current = performance.now();
+      
+      if (simulationState === SimulationState.COMPLETED) { if (isGlobe) targetCenter = HOME_COORDINATES; targetScale = baseScale; } 
+      else if (simulationState === SimulationState.PLAYING && currentEventId) {
+         const currentEvent = events.find(e => e.id === currentEventId);
+         if (currentEvent) {
+             const data = resolvedEventData.find(r => r.event.id === currentEvent.id);
+             targetCenter = data?.centroid || null;
+             if (targetCenter) targetScale = baseScale * config.zoomInMultiplier;
+         }
       }
-  };
+      
+      if (currentEventId === prevEventIdRef.current && simulationState === prevSimStateRef.current && simulationState === SimulationState.IDLE) { render(); return; }
+      
+      prevEventIdRef.current = currentEventId; prevSimStateRef.current = simulationState;
+      
+      if (targetCenter) {
+        svg.interrupt();
+        if (isGlobe) {
+            let r1: [number, number, number] = [-targetCenter[0], -targetCenter[1], 0]; const s1 = targetScale; const r0 = currentTransform.current.rotate;
+            const lonDiff = r1[0] - r0[0]; if (lonDiff > 180) r1[0] -= 360; else if (lonDiff < -180) r1[0] += 360;
+            const s0 = currentTransform.current.scale; isTransitioningRef.current = true;
+            svg.transition().duration(config.animationSpeed).ease(d3.easeCubicInOut).tween("projectionUpdate", () => {
+                   const i_r = d3.interpolate(r0, r1); const i_s = d3.interpolate(s0, s1);
+                   return (t: number) => { const rot = i_r(t) as [number, number, number]; const sc = i_s(t); projection.rotate(rot); projection.scale(sc); svg.select('circle.atmosphere').attr('r', sc); currentTransform.current = { ...currentTransform.current, rotate: rot, scale: sc }; render(); };
+                }).on("end", () => { isTransitioningRef.current = false; render(); onAnimationComplete(); });
+        } else {
+            const px = projection(targetCenter);
+            let t1: [number, number] = px ? [width/2 + (width/2 - px[0]), height/2 + (height/2 - px[1])] : [width/2, height/2];
+            const t0 = currentTransform.current.translate; const s0 = currentTransform.current.scale; isTransitioningRef.current = true;
+            svg.transition().duration(config.animationSpeed).ease(d3.easeCubicInOut).tween("projectionUpdate", () => {
+                     const i_t = d3.interpolate(t0, t1); const i_s = d3.interpolate(s0, targetScale);
+                     return (t: number) => { const tr = i_t(t); const sc = i_s(t); projection.translate(tr).scale(sc); currentTransform.current = { ...currentTransform.current, translate: tr as [number, number], scale: sc }; render(); };
+                }).on("end", () => { isTransitioningRef.current = false; render(); onAnimationComplete(); });
+        }
+      } else render();
+    };
 
-  const visitedCount = events.filter(e => e.isVisited).length;
-  const totalCount = events.length;
+    startTransition();
+    const timer = d3.timer(() => { if (!isTransitioningRef.current) render(); });
+    return () => timer.stop();
+  }, [geoData, usStatesData, dimensions, events, colors, simulationState, currentEventId, config, targetMarkerUrl, markerImage, resolveFeature, onAnimationComplete, resolvedEventData, viewOptions.showMotionLines, viewOptions.layerConfig, viewOptions.trailStyle]);
+
+  const getFlagUrl = useCallback((countryName: string) => {
+        const cleanName = countryName.trim();
+        let code = COUNTRY_ISO_CODES[cleanName] || COUNTRY_ISO_CODES[cleanName.replace(/ \((USA|Country)\)$/, "")] || COUNTRY_ISO_CODES[MAJOR_CITIES.find(c => c.name.toLowerCase() === cleanName.toLowerCase())?.country || ""];
+        return code ? `https://flagcdn.com/w320/${code.toLowerCase()}.png` : null;
+  }, []);
+
+  const getFormattedDate = useCallback((event: ExpansionEvent) => {
+        const date = new Date(event.year, event.month - 1, event.day);
+        if (viewOptions.dateFormat === 'number-name') return date.toLocaleDateString('en-GB', { day: '2-digit', month: 'long' });
+        if (viewOptions.dateFormat === 'month-name') return date.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+        return `${event.year}.${String(event.month).padStart(2, '0')}.${String(event.day).padStart(2, '0')}`;
+  }, [viewOptions.dateFormat]);
 
   const getCounterPositionClass = (pos: string) => {
-      switch(pos) {
-          case 'top-left': return 'top-8 left-8';
-          case 'center-left': return 'top-1/2 left-8 -translate-y-1/2';
-          case 'bottom-left': return 'bottom-8 left-8';
-          case 'bottom-center': return 'bottom-8 left-1/2 -translate-x-1/2';
-          case 'bottom-right': return 'bottom-8 right-8';
-          case 'center-right': return 'top-1/2 right-8 -translate-y-1/2';
-          case 'top-right': return 'top-8 right-8';
-          case 'top-center': return 'top-8 left-1/2 -translate-x-1/2';
-          default: return 'top-8 right-8';
-      }
+        switch(pos) {
+            case 'top-left': return 'top-6 left-6'; case 'center-left': return 'top-1/2 -translate-y-1/2 left-6'; case 'bottom-left': return 'bottom-6 left-6'; case 'bottom-center': return 'bottom-6 left-1/2 -translate-x-1/2'; case 'bottom-right': return 'bottom-6 right-6'; case 'center-right': return 'top-1/2 -translate-y-1/2 right-6'; case 'top-right': return 'top-6 right-6'; case 'top-center': return 'top-6 left-1/2 -translate-x-1/2'; default: return 'top-6 right-6';
+        }
   };
-  
-  // Decide which event to show based on style
-  // For '3d-worldmap', we use the locally managed visibleEvent (for exit transitions).
-  // For others, we assume instant switch (visibleEvent syncs instantly in useEffect).
-  const displayEvent = visibleEvent;
 
   return (
-    <div 
-      ref={containerRef} 
-      className="relative w-full h-full bg-slate-950 overflow-hidden"
-    >
-      <style>{`
-        @keyframes fadeInScale {
-          from { opacity: 0; transform: translate(-50%, -45%) scale(0.9); }
-          to { opacity: 1; transform: translate(-50%, -50%) scale(1); }
-        }
-        .animate-cinematic-enter {
-          animation: fadeInScale 0.8s cubic-bezier(0.16, 1, 0.3, 1) forwards;
-        }
-
-        @keyframes foldIn {
-          0% { opacity: 0; transform: perspective(1000px) rotateX(45deg) scale(0.8) translateY(20px); }
-          100% { opacity: 1; transform: perspective(1000px) rotateX(0deg) scale(1) translateY(0); }
-        }
-        @keyframes foldOut {
-          0% { opacity: 1; transform: perspective(1000px) rotateX(0deg) scale(1) translateY(0); }
-          100% { opacity: 0; transform: perspective(1000px) rotateX(-45deg) scale(0.8) translateY(-20px); }
-        }
-        .animate-3d-enter {
-           animation: foldIn 0.6s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
-        }
-        .animate-3d-exit {
-           animation: foldOut 0.5s cubic-bezier(0.32, 0, 0.67, 0) forwards;
-        }
-      `}</style>
-      
-      <svg ref={svgRef} className="absolute inset-0 w-full h-full block cursor-move z-10">
-        <g></g>
-      </svg>
-      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full block pointer-events-none z-20" />
-      
-      {/* Center Icon System */}
-      {viewOptions.showCenterIcon && centerIconUrl && (
-          <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 pointer-events-none z-[25] flex items-center justify-center">
-              <img 
-                 src={centerIconUrl} 
-                 alt="Center Decoration" 
-                 style={{ 
-                    width: `${128 * config.centerIconScale}px`, 
-                    height: `${128 * config.centerIconScale}px` 
-                 }}
-                 className="object-contain opacity-80" 
-              />
-          </div>
-      )}
-      
-      {/* Information Overlay */}
-      {isUiVisible && simulationState === SimulationState.PLAYING && displayEvent && (
-         <>
-           {(viewOptions.infoStyle === 'default' || viewOptions.infoStyle === 'flag-center' || viewOptions.infoStyle === 'minimal' || viewOptions.infoStyle === '3d-card') && (
-               <div className="absolute top-8 left-1/2 transform -translate-x-1/2 z-30 min-w-[300px]">
-                   {viewOptions.infoStyle === 'default' && (
-                     <div className="bg-slate-900/90 backdrop-blur-md text-white px-6 py-4 rounded-xl shadow-2xl border border-slate-700/50">
-                       <div className="flex items-center gap-5">
-                          <div className="w-20 h-14 bg-slate-800 rounded overflow-hidden flex-shrink-0 border border-slate-600 shadow-inner">
-                            {getFlagUrl(displayEvent.countryName) ? (
-                                <img 
-                                    src={getFlagUrl(displayEvent.countryName)!} 
-                                    alt={displayEvent.countryName}
-                                    className="w-full h-full object-cover"
-                                />
-                            ) : (
-                                <div className="w-full h-full flex items-center justify-center text-2xl">
-                                   {config.mapMode === 'usa' ? '🇺🇸' : '🏳️'}
-                                </div>
-                            )}
-                          </div>
-                          <div className="flex flex-col">
-                            <h2 className="text-2xl font-bold leading-tight tracking-tight">{displayEvent.countryName}</h2>
-                            <div className="flex items-center gap-2 mt-1">
-                              <div className="px-2 py-0.5 rounded bg-blue-500/20 text-blue-300 text-xs font-semibold border border-blue-500/30">
-                                EXPANSION EVENT
-                              </div>
-                              <p className="text-sm font-medium text-slate-400 font-mono">
-                                {getFormattedDate(displayEvent)}
-                            </p>
-                          </div>
-                          </div>
-                       </div>
-                     </div>
-                   )}
-
-                   {viewOptions.infoStyle === 'flag-center' && (
-                     <div className="bg-slate-900/90 backdrop-blur-md text-white px-6 py-4 rounded-xl shadow-2xl border border-slate-700/50">
-                       <div className="flex flex-col items-center text-center gap-3 py-2">
-                          <div className="w-32 h-20 bg-slate-800 rounded overflow-hidden shadow-lg border border-slate-600">
-                            {getFlagUrl(displayEvent.countryName) ? (
-                                <img 
-                                    src={getFlagUrl(displayEvent.countryName)!} 
-                                    alt={displayEvent.countryName}
-                                    className="w-full h-full object-cover"
-                                />
-                            ) : (
-                                <div className="w-full h-full flex items-center justify-center text-3xl">
-                                   {config.mapMode === 'usa' ? '🇺🇸' : '🏳️'}
-                                </div>
-                            )}
-                          </div>
-                          <div>
-                            <h2 className="text-2xl font-bold">{displayEvent.countryName}</h2>
-                            <p className="text-sm font-medium text-slate-400 font-mono mt-1">
-                                {getFormattedDate(displayEvent)}
-                            </p>
-                          </div>
-                       </div>
-                     </div>
-                   )}
-
-                   {viewOptions.infoStyle === 'minimal' && (
-                     <div className="bg-slate-900/90 backdrop-blur-md text-white px-6 py-4 rounded-xl shadow-2xl border border-slate-700/50">
-                       <div className="text-center py-1">
-                            <h2 className="text-2xl font-bold">{displayEvent.countryName}</h2>
-                            <p className="text-sm font-medium text-slate-400 font-mono mt-1">
-                                {getFormattedDate(displayEvent)}
-                            </p>
-                       </div>
-                     </div>
-                   )}
-                   
-                   {viewOptions.infoStyle === '3d-card' && (
-                      <div className="flex flex-col items-center" style={{ perspective: '1000px' }}>
-                        <div 
-                          className="relative bg-slate-900/80 border border-slate-500/30 p-6 rounded-2xl shadow-[0_20px_50px_rgba(0,0,0,0.5)] flex flex-col items-center gap-4 backdrop-blur-xl"
-                          style={{ transform: 'rotateX(10deg)', transformStyle: 'preserve-3d' }}
-                        >
-                            <div className="absolute inset-0 bg-gradient-to-b from-white/5 to-transparent rounded-2xl pointer-events-none"></div>
-                            <div className="absolute inset-0 rounded-2xl border-2 border-white/5 shadow-[inset_0_0_20px_rgba(255,255,255,0.05)] pointer-events-none"></div>
-                            
-                            <div className="w-24 h-16 shadow-2xl rounded-lg overflow-hidden border border-white/10 relative z-10 transform translate-z-10">
-                               {getFlagUrl(displayEvent.countryName) ? (
-                                    <img 
-                                        src={getFlagUrl(displayEvent.countryName)!} 
-                                        alt={displayEvent.countryName}
-                                        className="w-full h-full object-cover"
-                                    />
-                                ) : (
-                                    <div className="w-full h-full bg-slate-800 flex items-center justify-center text-3xl">
-                                       {config.mapMode === 'usa' ? '🇺🇸' : '🏳️'}
-                                    </div>
-                                )}
-                            </div>
-                            <div className="text-center relative z-10">
-                               <h2 className="text-3xl font-black bg-clip-text text-transparent bg-gradient-to-b from-white to-slate-400 drop-shadow-sm tracking-tight">
-                                  {displayEvent.countryName.toUpperCase()}
-                               </h2>
-                               <div className="mt-2 inline-block px-3 py-1 bg-blue-500/20 border border-blue-500/30 rounded-full">
-                                   <p className="text-sm font-bold text-blue-200 font-mono tracking-widest">
-                                      {getFormattedDate(displayEvent)}
-                                   </p>
-                               </div>
-                            </div>
+    <div ref={containerRef} className="relative w-full h-full bg-[#0f172a] overflow-hidden select-none">
+      <canvas ref={canvasRef} className="absolute inset-0 pointer-events-none z-0" />
+      <svg ref={svgRef} className="absolute inset-0 w-full h-full pointer-events-none z-10" />
+      <canvas ref={markersCanvasRef} className="absolute inset-0 pointer-events-none z-20" />
+      {viewOptions.showCenterIcon && centerIconUrl && (<div className="absolute top-1/2 left-1/2 pointer-events-none z-30 transition-transform duration-300" style={{ transform: `translate(-50%, -50%) scale(${config.centerIconScale})` }}><img src={centerIconUrl} alt="Center" className="w-16 h-16 object-contain opacity-90 drop-shadow-[0_0_15px_rgba(59,130,246,0.6)]" /></div>)}
+      {viewOptions.showCounter && (<div className={`absolute ${getCounterPositionClass(viewOptions.counterPosition)} pointer-events-none z-50 transition-all duration-500`}><div className="bg-slate-900/80 backdrop-blur-md px-5 py-3 rounded-xl border border-slate-700/50 shadow-2xl flex items-center gap-4 group"><div className="flex flex-col"><span className="text-[10px] uppercase text-slate-400 font-bold tracking-wider mb-0.5">Progress</span><div className="flex items-baseline gap-1.5"><span className="text-2xl font-bold text-white leading-none tracking-tight">{events.filter(e => e.isVisited).length}</span><span className="text-sm text-slate-500 font-medium">/ {events.length}</span></div></div><div className="h-8 w-[1px] bg-slate-700/50"></div><div className="flex flex-col"><span className="text-[10px] uppercase text-slate-400 font-bold tracking-wider mb-0.5">Year</span><span className="text-lg font-bold text-blue-400 leading-none">{visibleEvent ? visibleEvent.year : events[0]?.year || new Date().getFullYear()}</span></div></div></div>)}
+      {visibleEvent && (
+        <div className={`absolute pointer-events-none transition-all duration-700 ease-in-out z-40 flex flex-col items-center justify-center 
+            ${viewOptions.infoStyle === '3d-card' 
+                ? 'top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2' 
+                : 'bottom-16 left-1/2 -translate-x-1/2'}
+            ${isOverlayActive ? 'opacity-100 translate-y-0 scale-100' : 'opacity-0 translate-y-4 scale-95'}
+        `}>
+           {viewOptions.infoStyle !== 'minimal' && (
+                <div className={`bg-slate-900/60 backdrop-blur-md border border-slate-700/50 shadow-2xl rounded-2xl overflow-hidden ${viewOptions.infoStyle === 'flag-center' ? 'p-6 flex-col text-center' : 'p-4 pr-8 flex items-center gap-6'} ${viewOptions.infoStyle === '3d-card' ? 'bg-slate-900/90 p-8 flex-col text-center border-slate-600' : ''} transition-all duration-500`}>
+                    {getFlagUrl(visibleEvent.countryName) && (
+                        <div className={`relative shadow-lg ${viewOptions.infoStyle === 'flag-center' || viewOptions.infoStyle === '3d-card' ? 'mb-4' : ''}`}>
+                            <img src={getFlagUrl(visibleEvent.countryName)!} alt="Flag" className={`object-cover rounded-md ${viewOptions.infoStyle === 'flag-center' || viewOptions.infoStyle === '3d-card' ? 'h-20 w-auto' : 'h-14 w-auto'}`} />
+                            <div className="absolute inset-0 rounded-md bg-gradient-to-tr from-black/10 to-white/10 pointer-events-none"></div>
                         </div>
-                     </div>
-                   )}
-               </div>
-           )}
-
-           {viewOptions.infoStyle === 'cinematic' && (
-               <div 
-                 key={displayEvent.id} 
-                 className="absolute top-1/2 left-1/2 z-40 animate-cinematic-enter pointer-events-none"
-               >
-                 <div className="flex flex-col items-center justify-center">
-                    <div className="relative mb-6 group">
-                        <div className="absolute -inset-4 bg-blue-500/30 blur-2xl rounded-full opacity-60"></div>
-                        <div className="w-56 h-36 bg-slate-800 rounded-lg overflow-hidden shadow-[0_0_60px_rgba(0,0,0,0.6)] border border-slate-600/50 relative z-10">
-                            {getFlagUrl(displayEvent.countryName) ? (
-                                <img 
-                                    src={getFlagUrl(displayEvent.countryName)!} 
-                                    alt={displayEvent.countryName}
-                                    className="w-full h-full object-cover"
-                                />
-                            ) : (
-                                <div className="w-full h-full flex items-center justify-center text-5xl">
-                                   {config.mapMode === 'usa' ? '🇺🇸' : '🏳️'}
-                                </div>
-                            )}
+                    )}
+                    <div className={`${viewOptions.infoStyle === 'flag-center' || viewOptions.infoStyle === '3d-card' ? 'text-center' : 'text-left'}`}>
+                        <h2 className="text-4xl font-bold text-white tracking-tight drop-shadow-lg mb-1">{visibleEvent.countryName}</h2>
+                        <div className="flex items-center gap-2 justify-center opacity-90">
+                            <span className="text-blue-400 font-mono text-xl font-medium tracking-wide bg-blue-500/10 px-2 py-0.5 rounded">{getFormattedDate(visibleEvent)}</span>
                         </div>
                     </div>
-                    
-                    <div className="text-center relative z-10">
-                       <h1 className="text-6xl font-black text-white tracking-tighter drop-shadow-2xl uppercase" style={{ textShadow: '0 4px 12px rgba(0,0,0,0.8)' }}>
-                          {displayEvent.countryName}
-                       </h1>
-                       <div className="mt-4 flex items-center justify-center gap-3">
-                           <div className="h-px w-12 bg-blue-400/50"></div>
-                           <p className="text-xl text-blue-200 font-mono tracking-[0.2em] font-bold shadow-black drop-shadow-md">
-                              {getFormattedDate(displayEvent)}
-                           </p>
-                           <div className="h-px w-12 bg-blue-400/50"></div>
-                       </div>
-                    </div>
-                 </div>
+                </div>
+           )}
+           {viewOptions.infoStyle === 'minimal' && (
+               <div className="flex flex-col items-center gap-1">
+                   <h1 className="text-5xl font-black text-transparent bg-clip-text bg-gradient-to-b from-white to-white/50 tracking-tighter drop-shadow-2xl">{visibleEvent.countryName.toUpperCase()}</h1>
+                   <p className="text-blue-400 font-mono text-lg tracking-widest uppercase opacity-80">{getFormattedDate(visibleEvent)}</p>
                </div>
            )}
-
-           {viewOptions.infoStyle === '3d-worldmap' && (
-               <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 z-40 pointer-events-none perspective-1000">
-                  <div 
-                     className={`
-                        relative flex flex-col items-center justify-center
-                        ${isExiting ? 'animate-3d-exit' : 'animate-3d-enter'}
-                     `}
-                  >
-                      {/* 3D Panel */}
-                      <div className="bg-slate-900/40 backdrop-blur-xl border border-white/10 p-8 rounded-3xl shadow-[0_30px_60px_rgba(0,0,0,0.5)] flex flex-col items-center gap-6 relative overflow-hidden">
-                          {/* Gloss Effect */}
-                          <div className="absolute inset-0 bg-gradient-to-br from-white/10 to-transparent pointer-events-none"></div>
-                          
-                          {/* Flag */}
-                          <div className="w-64 h-40 rounded-xl overflow-hidden shadow-2xl border border-white/20 relative z-10 transform transition-transform hover:scale-105 duration-500">
-                             {getFlagUrl(displayEvent.countryName) ? (
-                                <img 
-                                    src={getFlagUrl(displayEvent.countryName)!} 
-                                    alt={displayEvent.countryName}
-                                    className="w-full h-full object-cover"
-                                />
-                             ) : (
-                                <div className="w-full h-full bg-slate-800 flex items-center justify-center text-6xl">
-                                   {config.mapMode === 'usa' ? '🇺🇸' : '🏳️'}
-                                </div>
-                             )}
-                             {/* Scanline overlay */}
-                             <div className="absolute inset-0 bg-[linear-gradient(rgba(18,16,16,0)_50%,rgba(0,0,0,0.25)_50%),linear-gradient(90deg,rgba(255,0,0,0.06),rgba(0,255,0,0.02),rgba(0,0,255,0.06))] bg-[length:100%_4px,6px_100%] pointer-events-none opacity-20"></div>
-                          </div>
-
-                          {/* Info */}
-                          <div className="text-center relative z-10">
-                              <h2 className="text-5xl font-black text-transparent bg-clip-text bg-gradient-to-b from-white to-slate-400 tracking-tight drop-shadow-sm">
-                                  {displayEvent.countryName}
-                              </h2>
-                              <div className="mt-3 inline-flex items-center gap-3 bg-black/30 px-4 py-2 rounded-full border border-white/5">
-                                 <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></div>
-                                 <span className="text-emerald-200 font-mono text-lg tracking-widest font-bold">
-                                    {getFormattedDate(displayEvent)}
-                                 </span>
-                              </div>
-                          </div>
-                      </div>
-                  </div>
-               </div>
-           )}
-         </>
-      )}
-
-      {/* Counter Overlay */}
-      {isUiVisible && viewOptions.showCounter && simulationState === SimulationState.PLAYING && (
-        <div className={`absolute ${getCounterPositionClass(viewOptions.counterPosition)} bg-slate-900/80 backdrop-blur-md border border-slate-700/50 rounded-lg p-3 shadow-xl z-30 transition-all duration-500`}>
-           <div className="text-xs text-slate-400 uppercase tracking-widest font-semibold mb-1">Progress</div>
-           <div className="text-2xl font-bold text-white font-mono text-center">
-              {visitedCount} <span className="text-slate-600">/</span> {totalCount}
-           </div>
         </div>
       )}
     </div>

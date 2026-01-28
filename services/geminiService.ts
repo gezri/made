@@ -1,3 +1,4 @@
+
 import { GoogleGenAI, Type } from "@google/genai";
 import { ExpansionEvent } from "../types";
 
@@ -14,12 +15,24 @@ const generateExpansionPlan = async (prompt: string, currentYear: number): Promi
     const systemInstruction = `
       You are a strategic business consultant. 
       Generate a global expansion timeline based on the user's request.
-      Return a list of countries with realistic dates starting from ${currentYear}.
-      Only use valid country names that exist on a standard world map.
+      Return a list of locations with realistic dates starting from ${currentYear}.
+      
+      Valid locations include:
+      1. All Countries (e.g., "Japan", "France", "Brazil", "Kenya").
+      2. All 50 United States (e.g., "California", "Texas", "New York", "Florida").
+      
+      IMPORTANT FORMATTING RULES:
+      - For Countries: Use the common English name (e.g., "South Korea", "Vietnam").
+      - For US States: Return ONLY the state name. Do NOT prefix with 'US', 'USA', or 'State of'. 
+        - Correct: "California"
+        - Incorrect: "USA - California", "US California"
+      
+      Ensure names match standard English naming conventions found on maps.
     `;
 
+    // FIX: Using gemini-3-flash-preview for text tasks as per guidelines.
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
+      model: "gemini-3-flash-preview",
       contents: prompt,
       config: {
         systemInstruction,
